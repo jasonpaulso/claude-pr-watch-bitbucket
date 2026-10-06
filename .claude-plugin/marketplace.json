@@ -1,0 +1,13 @@
+{
+  "name": "bb-pr-watch",
+  "owner": {
+    "name": "Rob Hannay"
+  },
+  "plugins": [
+    {
+      "name": "bb-pr-watch",
+      "source": "./plugins/bb-pr-watch",
+      "description": "Live Bitbucket PR watching inside Claude Code sessions: comments, approvals, CI (pipeline) changes, merges — auto-armed every session via a SessionStart hook. Uses the twg CLI."
+    }
+  ]
+}
