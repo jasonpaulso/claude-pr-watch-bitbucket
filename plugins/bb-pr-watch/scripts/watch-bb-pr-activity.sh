@@ -58,6 +58,9 @@ MAX_CYCLES="${WATCH_MAX_CYCLES:-0}"
 TWG="${WATCH_TWG:-twg}"
 TWG_ARGS="--output json --output-summary none"
 SIGNATURE="${WATCH_SIGNATURE:--CC}"
+# Must be normalised: the hook never sets it, and a bare "$WATCH_SINCE" under
+# `set -u` aborts the whole watcher on cycle one — which is every cycle.
+SINCE="${WATCH_SINCE:-}"
 
 # Derived, not mktemp: a re-arm after timeout must land on the same state.
 STATE_DIR="${WATCH_STATE_DIR:-${LIST%.watchlist}.state}"
@@ -192,8 +195,8 @@ while true; do
   # last/ at the end of every cycle, so a re-arm resumes instead of replaying,
   # and a long-running watch never re-sends the same comments. WATCH_SINCE
   # overrides it on the first cycle only — it is a backfill switch, not a filter.
-  if [ "$cycle" -eq 1 ] && [ -n "$WATCH_SINCE" ]; then
-    last="$WATCH_SINCE"
+  if [ "$cycle" -eq 1 ] && [ -n "$SINCE" ]; then
+    last="$SINCE"
   else
     last=$(cat "$LASTF" 2>/dev/null)
     [ -z "$last" ] && last="$now"
