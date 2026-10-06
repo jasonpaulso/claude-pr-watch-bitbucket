@@ -23,15 +23,18 @@
 # twg from writing per-run payload files.
 #
 # Env overrides (for testing): WATCH_INTERVAL, WATCH_MAX_CYCLES (0 = forever),
-# WATCH_STATE_DIR (pre-seeded state diffs on the first cycle), WATCH_TWG
-# (path to the twg binary), WATCH_COMMENT_LIMIT (comments fetched per PR).
+# WATCH_STATE_DIR (pre-seeded state diffs on the first cycle), WATCH_SINCE
+# (comment floor), WATCH_TWG (path to the twg binary).
 set -u
+# Byte-wise collation everywhere: `sort` and `join` must agree, and the
+# watchlist keys are ASCII. Without this, a non-C locale can make join treat
+# sorted input as unsorted and silently drop rows.
+export LC_ALL=C
 
 LIST="${WATCH_LIST:?set WATCH_LIST to the watchlist file path}"
 INTERVAL="${WATCH_INTERVAL:-60}"
 MAX_CYCLES="${WATCH_MAX_CYCLES:-0}"
 TWG="${WATCH_TWG:-twg}"
-COMMENT_LIMIT="${WATCH_COMMENT_LIMIT:-50}"
 TWG_ARGS="--output json --output-summary none"
 STATE_DIR="${WATCH_STATE_DIR:-}"
 CLEANUP=0
@@ -146,7 +149,7 @@ while true; do
   # Normalize the watchlist (URLs -> workspace/repo#num), dedupe, drop finished.
   keys=""
   if [ -f "$LIST" ]; then
-    keys=$(sed -E 's|https?://bitbucket\.org/([^/]+)/([^/]+)/pull-requests/([0-9]+).*|\1/\2#\3|' "$LIST" \
+    keys=$(sed -E 's|^(https?://)?(www\.)?bitbucket\.org/([^/]+)/([^/]+)/pull-requests/([0-9]+).*|\3/\4#\5|' "$LIST" \
       | grep -E '^[^/ ]+/[^# ]+#[0-9]+$' | sort -u | grep -vxF -f "$DONE" || true)
   fi
   if [ -z "$keys" ]; then

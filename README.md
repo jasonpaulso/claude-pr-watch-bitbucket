@@ -53,7 +53,6 @@ Environment variables read by `scripts/watch-bb-pr-activity.sh`:
 | `WATCH_MAX_CYCLES` | `0` (forever) | Stop after N cycles — useful for testing |
 | `WATCH_SINCE` | now | ISO-8601 UTC floor for comments — set in the past to replay today's discussion on the first cycle |
 | `WATCH_TWG` | `twg` | Path to the `twg` binary |
-| `WATCH_COMMENT_LIMIT` | `50` | Comments fetched per PR per cycle |
 
 `BB_HOST_PATTERN` (read by the SessionStart hook) sets which git remote host counts as Bitbucket when auto-seeding — default `bitbucket`, set it to your Bitbucket Server hostname if you self-host.
 
@@ -72,7 +71,7 @@ twg --output json --output-summary none bb prs get <id> \
 
 - **Session-scoped**: nothing watches while no Claude Code session is open. For always-on coverage, pair with a webhook-backed bot.
 - **Bitbucket Cloud**: keys are `workspace/repo#id`. Fork-based PRs (`project/repo (fork)`) need the fork's `workspace/repo`.
-- A PR whose comment count exceeds `WATCH_COMMENT_LIMIT` may report late — raise it if you have long-running discussions.
+- A PR whose comment count exceeds what one `bb prs get --comments` call returns (the hydration page) may report late — keep discussions under ~50 comments per PR, or re-arm with `WATCH_SINCE` to replay them.
 - Review-level "LGTM" approvals with no comment *are* covered (via the approvals set); unapproved-but-commented PRs show up as COMMENTS.
 - Polling: comments/CI can lag up to one interval (~60s).
 

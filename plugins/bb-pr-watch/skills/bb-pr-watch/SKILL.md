@@ -38,4 +38,4 @@ Triage agentically — surface and act on what matters, stay quiet on noise:
 
 ## Tuning
 
-Env vars: `WATCH_INTERVAL` (poll seconds, default 60), `WATCH_STATE_DIR` (pre-seeded state), `WATCH_MAX_CYCLES` and `WATCH_SINCE` (testing/backfill), `WATCH_TWG` (path to the binary), `WATCH_COMMENT_LIMIT` (comments fetched per PR per cycle). The comment stream is deliberately unfiltered — filtering is the consuming session's job.
+Env vars: `WATCH_INTERVAL` (poll seconds, default 60), `WATCH_STATE_DIR` (pre-seeded state), `WATCH_MAX_CYCLES` and `WATCH_SINCE` (testing/backfill), `WATCH_TWG` (path to the binary). The comment stream is deliberately unfiltered — filtering is the consuming session's job.
