@@ -4,8 +4,10 @@
 #
 #   WATCHING     — a PR was added to the watchlist (confirmation, emitted once)
 #   COMMENTS     — new *and edited* comments, grouped per PR per cycle with a
-#                  count. Authors are tagged: [review] AI reviewer, [ci-noise]
-#                  dashboard/bot notice, [app] other automation, untagged human.
+#                  count. Each entry is labelled "author (kind, source)": (new) /
+#                  (edited) plus a source suffix — (…, review-bot) AI reviewer,
+#                  (…, automation) dashboard/bot notice posted under a human name,
+#                  (…, app) other automation; no suffix means a human.
 #   APPROVALS    — the set of approvals on a PR changed (a reviewer signed off)
 #   CI           — the pipeline rollup on the PR's current tip changed
 #                  (passing / failing / pending / no-build)
