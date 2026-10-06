@@ -3,6 +3,7 @@
   "owner": {
     "name": "Rob Hannay"
   },
+  "description": "Marketplace for bb-pr-watch: session-scoped Bitbucket PR watching inside Claude Code (comments, approvals, pipeline status, merges), powered by the twg CLI.",
   "plugins": [
     {
       "name": "bb-pr-watch",
