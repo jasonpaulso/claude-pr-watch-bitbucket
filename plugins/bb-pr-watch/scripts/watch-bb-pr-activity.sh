@@ -3,9 +3,9 @@
 # per event on stdout (consumed by a Claude Code Monitor):
 #
 #   WATCHING     — a PR was added to the watchlist (confirmation, emitted once)
-#   COMMENTS     — new comments, grouped per PR per cycle with a count
-#                  (unfiltered snippets; the consuming Claude session should fetch
-#                  the full thread before acting)
+#   COMMENTS     — new *and edited* comments, grouped per PR per cycle with a
+#                  count. Authors are tagged: [review] AI reviewer, [ci-noise]
+#                  dashboard/bot notice, [app] other automation, untagged human.
 #   APPROVALS    — the set of approvals on a PR changed (a reviewer signed off)
 #   CI           — the pipeline rollup on the PR's current tip changed
 #                  (passing / failing / pending / no-build)
@@ -18,8 +18,24 @@
 # The file is re-read every cycle, so appending a line starts watching that PR
 # within one interval — no restart needed. Duplicates and blank lines are fine.
 #
-# Every lookup goes through the twg CLI (Atlassian Teamwork Graph), one call per
-# PR per cycle returning state + pipeline statuses + comments (~1.3s each):
+# STATE IS DURABLE, AND IT HAS TO BE
+# ------------------------------------
+# The Monitor tool has no `persistent` option in current Claude Code: every
+# watch dies at `timeout_ms` (max 30 minutes) and you re-arm it with the same
+# command. So state lives next to the watchlist, in a path derived from it
+# (<watchlist>.state), never in a fresh mktemp dir:
+#   prev.tsv      last snapshot (diffing baseline for every event above)
+#   last          the timestamp of the last check — a re-arm resumes from HERE,
+#                 so nothing in the gap between watches is lost, and a re-arm
+#                 does not re-send WATCHING for PRs that were already watched.
+#   done.keys     merged/declined PRs, never looked at again
+#   fail.keys     lookups that failed last cycle (for once-per-streak notices)
+#   posted.ids    comment ids this session posted itself — never echoed back
+# Delete the state dir when you retire the watchlist; until then it survives
+# every re-arm.
+#
+# Each cycle makes one twg call per PR (~1.3s) returning state + pipeline
+# statuses + comments:
 #   twg --output json --output-summary none bb prs get <id> -w <ws> -r <repo> \
 #       --statuses --comments
 # `--output-summary none` matters: stdout stays pure JSON (fed straight to jq)
@@ -27,9 +43,8 @@
 # otherwise accumulate by the thousand.
 #
 # Env overrides (for testing): WATCH_INTERVAL, WATCH_MAX_CYCLES (0 = forever),
-# WATCH_STATE_DIR (pre-seeded state diffs on the first cycle), WATCH_SINCE
-# (comment floor; set in the past to replay today's discussion), WATCH_TWG
-# (path to the twg binary).
+# WATCH_STATE_DIR, WATCH_SINCE (comment floor), WATCH_TWG, WATCH_SIGNATURE
+# (the signature your own posted comments end with; default "-CC").
 set -u
 
 # Byte-wise collation everywhere: `sort` and `join` must agree, and the keys are
@@ -42,25 +57,24 @@ INTERVAL="${WATCH_INTERVAL:-60}"
 MAX_CYCLES="${WATCH_MAX_CYCLES:-0}"
 TWG="${WATCH_TWG:-twg}"
 TWG_ARGS="--output json --output-summary none"
+SIGNATURE="${WATCH_SIGNATURE:--CC}"
 
-STATE_DIR="${WATCH_STATE_DIR:-}"
-CLEANUP=0
-if [ -z "$STATE_DIR" ]; then
-  STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/bb-pr-watch.XXXXXX") || exit 1
-  CLEANUP=1
-else
-  mkdir -p "$STATE_DIR"
-fi
+# Derived, not mktemp: a re-arm after timeout must land on the same state.
+STATE_DIR="${WATCH_STATE_DIR:-${LIST%.watchlist}.state}"
+mkdir -p "$STATE_DIR" || exit 1
 
 PREV="$STATE_DIR/prev.tsv"       # key <TAB> state <TAB> ci <TAB> approvals <TAB> title
 CUR="$STATE_DIR/cur.tsv"
 DONE="$STATE_DIR/done.keys"      # merged/declined keys — skipped on every later cycle
 FAIL="$STATE_DIR/fail.keys"      # keys whose lookup failed last cycle
+LASTF="$STATE_DIR/last"          # time of the last check (survives re-arms)
+POSTED="$STATE_DIR/posted.ids"   # comment ids this session posted — never echoed back
 COLLECTED="$STATE_DIR/comments.tsv"
 # PREV/FAIL must exist (empty) so join and the failure-diff work on cycle one.
-touch "$DONE" "$FAIL" "$PREV"
+touch "$DONE" "$FAIL" "$PREV" "$POSTED"
 TAB=$(printf '\t')
-trap '[ "$CLEANUP" = 1 ] && rm -rf "$STATE_DIR"' EXIT
+# Lock is removed on exit; state is NOT (it must outlive every re-arm).
+trap '[ -n "${LOCK:-}" ] && rm -f "$LOCK"' EXIT
 
 # Singleton per watchlist: /clear re-fires the SessionStart hook while the old
 # monitor is still running, so a duplicate watcher may get armed. The lock makes
@@ -76,7 +90,7 @@ if ! ( set -C; echo $$ > "$LOCK" ) 2>/dev/null; then
   # Can't create a lock (e.g. unwritable dir): run unlocked rather than not at all.
   ( set -C; echo $$ > "$LOCK" ) 2>/dev/null || LOCK=""
 fi
-trap '[ "$CLEANUP" = 1 ] && rm -rf "$STATE_DIR"; [ -n "$LOCK" ] && rm -f "$LOCK"' EXIT
+trap '[ -n "${LOCK:-}" ] && rm -f "$LOCK"' EXIT
 trap 'exit 0' TERM   # superseded watchers stop cleanly, not as failures
 
 # /clear hands the SAME session process a NEW session_id — new watchlist, new
@@ -139,22 +153,47 @@ PR_FILTER='
   | "\($key)\t\(.state)\t\($ci)\t\($appr)\t\(.title // "" | gsub("[\\r\\n\\t]+"; " ") | .[0:120])"
 '
 
-# Same payload -> comment rows: key <TAB> author[ on path] <TAB> snippet.
+# Same payload -> comment rows: key <TAB> "author [on path] (kind, source)" <TAB> snippet
+#
+# Two things this must catch that a naive "created since last poll" does not:
+#   * EDITED comments. The CI Claude review edits its own comment instead of
+#     posting a new one, so a fresh finding arrives with a new updated_on and an
+#     old created_on. Watch both, and label which one it is.
+#   * Our own posts. Comments this session posted (signed "-CC", or recorded in
+#     posted.ids) are our own words — echoing them back as "new comments" would
+#     be an instruction loop, not news.
 # Timestamps come back UTC ("...+00:00"); truncating both sides to seconds keeps
 # plain string comparison equivalent to time comparison here.
 COMMENT_FILTER='
-  (.["_comments"] // [])[]
+  (._comments // [])[]
   | select((.deleted // false) | not)
   | select((.pending // false) | not)
-  | select((.created_on // "")[0:19] > $last)
-  | "\($key)\t\(.user.display_name // "?")\(if .user.type == "app_user" then " [app]" else "" end)\(if .inline then " on \(.inline.path // "?")" else "" end)\t\((.content.raw // "") | gsub("[\\r\\n\\t]+"; " ") | .[0:140])"
+  | ((.id // 0) | tostring) as $cid
+  | select(($posted | index(" " + $cid + " ")) == null)
+  | ((.content.raw // "") | sub("\\s+$"; "")) as $body
+  | select(($body | endswith($sig)) | not)
+  | (if ((.created_on // "")[0:19] > $last) then "new"
+     elif ((.updated_on // "")[0:19] > $last) then "edited"
+     else empty end) as $kind
+  | (if ($body | test("(?i)claude review|\\U0001F916")) then ", review-bot"
+     elif ($body | test("NX_CLOUD_APP_COMMENT_END|cloud\\.nx\\.app|View your \\[CI Pipeline Execution")) then ", automation"
+     elif ((.user.type // "") == "app_user") then ", app"
+     else "" end) as $who
+  | "\($key)\t\(.user.display_name // "?")\(if .inline then " on \(.inline.path // "?")" else "" end) (\($kind)\($who))\t\($body | gsub("[\\r\\n\\t]+"; " ") | .[0:140])"
 '
 
 cycle=0
-last="${WATCH_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%S)}"
-
+# Resume from the last check if a previous watch left one (no gap, no duplicate
+# WATCHING); otherwise start from now, or from WATCH_SINCE for a backfill.
+if [ -s "$LASTF" ]; then
+  last=$(cat "$LASTF")
+else
+  last="${WATCH_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%S)}"
+fi
 while true; do
   [ "$cycle" -gt 0 ] && sleep "$INTERVAL"
+  # Re-read every cycle: the session appends ids as it posts comments.
+  posted=" $(tr -d ' \t' < "$POSTED" | tr '\n' ' ')"
   cycle=$((cycle + 1))
   now=$(date -u +%Y-%m-%dT%H:%M:%S)
 
@@ -165,6 +204,7 @@ while true; do
       | grep -E '^[^/ ]+/[^# ]+#[0-9]+$' | sort -u | grep -vxF -f "$DONE" || true)
   fi
   if [ -z "$keys" ]; then
+    printf '%s\n' "$now" > "$LASTF"
     [ "$MAX_CYCLES" != 0 ] && [ "$cycle" -ge "$MAX_CYCLES" ] && exit 0
     continue
   fi
@@ -183,7 +223,8 @@ while true; do
 
     if [ -n "$row" ]; then
       printf '%s\n' "$row" >> "$CUR"
-      printf '%s' "$payload" | jq -r --arg key "$key" --arg last "$last" "$COMMENT_FILTER" \
+      printf '%s' "$payload" | jq -r --arg key "$key" --arg last "$last" \
+        --arg sig "$SIGNATURE" --arg posted "$posted" "$COMMENT_FILTER" \
         >> "$COLLECTED" 2>/dev/null
     else
       # Lookup failed (bad key, no access, twg not authenticated, API blip).
@@ -198,13 +239,14 @@ while true; do
   sort -o "$CUR" "$CUR"
 
   # --- emit this cycle's events -------------------------------------------------
-  # Newly watched PRs (in cur, not prev). PREV is empty on the first cycle, so
-  # every seeded PR gets a WATCHING confirmation there.
+  # Newly watched PRs (in cur, not prev). PREV is empty on the very first cycle,
+  # so every seeded PR gets a WATCHING confirmation there — and on every re-arm
+  # after a timeout, nothing does, because PREV survived.
   join -t "$TAB" -j 1 -v 2 "$PREV" "$CUR" 2>/dev/null \
     | awk -F'\t' '{printf "WATCHING: %s — %s (%s, CI: %s)\n", $1, $5, tolower($2), $3}'
 
-  # State transitions, CI changes, new approvals (only for PRs we could read in
-  # both cycles; a carried-forward row is byte-identical so nothing fires).
+  # State transitions, CI changes, new approvals. A carried-forward row is
+  # byte-identical to last cycle's, so a failed lookup fires nothing.
   join -t "$TAB" -j 1 "$PREV" "$CUR" 2>/dev/null > "$STATE_DIR/joined.tsv"
   awk -F'\t' '$2 == "OPEN" && $6 == "MERGED"   {printf "MERGED: %s — %s\n", $1, $9}
               $2 == "OPEN" && $6 == "DECLINED"  {printf "DECLINED: %s — %s\n", $1, $9}
@@ -218,8 +260,8 @@ while true; do
   grep -vxF -f "$FAIL" "$STATE_DIR/fail.new" 2>/dev/null \
     | awk -F'\t' '{printf "WATCH ERROR: %s — %s\n", $1, $2}'
 
-  # New comments — grouped per PR into ONE event line so a burst of review
-  # comments can't split across notifications.
+  # New/edited comments — grouped per PR into ONE event line so a burst of
+  # review comments can't split across notifications.
   awk -F'\t' '
     { c[$1]++; if (t[$1] != "") t[$1] = t[$1] " ¦ "; t[$1] = t[$1] $2 ": " $3 }
     END { for (k in c) printf "COMMENTS %s — %d new: %s\n", k, c[k], substr(t[k], 1, 500) }
@@ -231,6 +273,6 @@ while true; do
 
   cp "$CUR" "$PREV"
   cp "$STATE_DIR/fail.new" "$FAIL"
-  last=$now
+  printf '%s\n' "$now" > "$LASTF"
   [ "$MAX_CYCLES" != 0 ] && [ "$cycle" -ge "$MAX_CYCLES" ] && exit 0
 done
