@@ -7,6 +7,7 @@ Live **Bitbucket** PR watching **inside your Claude Code session**. Each session
 - 🚦 **CI (Bitbucket Pipelines)** — the rollup over the build statuses attached to the PR's *current* tip commit: `passing` / `failing` / `pending` / `no-build`. Red is always surfaced; pending↔passing flapping while you push is self-throttled.
 - 🎉 **Merges and declines** — detected from PR state, then the PR drops off the watchlist automatically.
 - 👀 **WATCHING confirmations** — one event when a PR joins the list.
+- ⚠️ **WATCH ERROR** — a PR lookup failed (bad key, no access, `twg` not authenticated). Reported once per failure streak, not once per poll.
 
 A `SessionStart` hook arms the watcher automatically in every session and tells Claude to register PRs liberally as they come up. It also checks whether your current branch has an open PR (`twg bb prs query --source <branch>`) and seeds the watchlist with it — so the PR you're working on is watched from the first minute, zero-touch.
 
