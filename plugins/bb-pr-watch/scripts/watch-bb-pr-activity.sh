@@ -183,19 +183,25 @@ COMMENT_FILTER='
 '
 
 cycle=0
-# Resume from the last check if a previous watch left one (no gap, no duplicate
-# WATCHING); otherwise start from now, or from WATCH_SINCE for a backfill.
-if [ -s "$LASTF" ]; then
-  last=$(cat "$LASTF")
-else
-  last="${WATCH_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%S)}"
-fi
 while true; do
   [ "$cycle" -gt 0 ] && sleep "$INTERVAL"
-  # Re-read every cycle: the session appends ids as it posts comments.
-  posted=" $(tr -d ' \t' < "$POSTED" | tr '\n' ' ')"
   cycle=$((cycle + 1))
   now=$(date -u +%Y-%m-%dT%H:%M:%S)
+
+  # Floor for THIS cycle: where the previous check left off. It is written to
+  # last/ at the end of every cycle, so a re-arm resumes instead of replaying,
+  # and a long-running watch never re-sends the same comments. WATCH_SINCE
+  # overrides it on the first cycle only — it is a backfill switch, not a filter.
+  if [ "$cycle" -eq 1 ] && [ -n "$WATCH_SINCE" ]; then
+    last="$WATCH_SINCE"
+  else
+    last=$(cat "$LASTF" 2>/dev/null)
+    [ -z "$last" ] && last="$now"
+  fi
+  # Never look into the future if a stale/invalid value got in.
+  [ "$last" \> "$now" ] && last="$now"
+  # Re-read every cycle: the session appends ids as it posts comments.
+  posted=" $(tr -d ' \t' < "$POSTED" | tr '\n' ' ')"
 
   # Normalize the watchlist (URLs -> workspace/repo#num), dedupe, drop finished.
   keys=""
