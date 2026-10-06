@@ -1,7 +1,7 @@
 {
   "name": "bb-pr-watch",
   "description": "Watch your open Bitbucket PRs from inside Claude Code: new comments, approvals, pipeline transitions, and merges land as live events in your session, and Claude triages them for you. Uses the twg CLI.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Rob Hannay"
   },
