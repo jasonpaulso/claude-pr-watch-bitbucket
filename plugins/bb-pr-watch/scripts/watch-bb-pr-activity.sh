@@ -8,6 +8,9 @@
 #                  (edited) plus a source suffix — (…, review-bot) AI reviewer,
 #                  (…, automation) dashboard/bot notice posted under a human name,
 #                  (…, app) other automation; no suffix means a human.
+#                  (edited) means the comment TEXT changed since it was last
+#                  reported; a bare updated_on bump (a reaction, a re-index) is
+#                  gated out on a hash of the body — see COMMENT_FILTER.
 #   APPROVALS    — the set of approvals on a PR changed (a reviewer signed off)
 #   CI           — the pipeline rollup on the PR's current tip changed
 #                  (passing / failing / pending / no-build)
@@ -33,6 +36,9 @@
 #   done.keys     merged/declined PRs, never looked at again
 #   fail.keys     lookups that failed last cycle (for once-per-streak notices)
 #   posted.ids    comment ids this session posted itself — never echoed back
+#   seen.tsv      key <TAB> comment id <TAB> hash of the comment text — the
+#                 baseline that says whether an (edited) event is real news or
+#                 just Bitbucket moving a timestamp
 # Delete the state dir when you retire the watchlist; until then it survives
 # every re-arm.
 #
@@ -60,6 +66,16 @@ MAX_CYCLES="${WATCH_MAX_CYCLES:-0}"
 TWG="${WATCH_TWG:-twg}"
 TWG_ARGS="--output json --output-summary none"
 SIGNATURE="${WATCH_SIGNATURE:--CC}"
+# Content hash for the comment gate (see COMMENT_FILTER / the gate in the loop).
+# Only comment candidates get hashed — a handful per cycle — so spawning a hasher
+# per candidate costs nothing worth mentioning.
+if command -v md5sum >/dev/null 2>&1; then
+  hash_text() { md5sum | cut -d' ' -f1; }
+elif command -v md5 >/dev/null 2>&1; then
+  hash_text() { md5 -q; }
+else
+  hash_text() { cksum | cut -d' ' -f1; }
+fi
 # Must be normalised: the hook never sets it, and a bare "$WATCH_SINCE" under
 # `set -u` aborts the whole watcher on cycle one — which is every cycle.
 SINCE="${WATCH_SINCE:-}"
@@ -74,9 +90,11 @@ DONE="$STATE_DIR/done.keys"      # merged/declined keys — skipped on every lat
 FAIL="$STATE_DIR/fail.keys"      # keys whose lookup failed last cycle
 LASTF="$STATE_DIR/last"          # time of the last check (survives re-arms)
 POSTED="$STATE_DIR/posted.ids"   # comment ids this session posted — never echoed back
+SEEN="$STATE_DIR/seen.tsv"       # key <TAB> comment id <TAB> hash of the comment text
 COLLECTED="$STATE_DIR/comments.tsv"
+CAND="$STATE_DIR/cand.raw"       # this cycle's comment candidates, pre-gate
 # PREV/FAIL must exist (empty) so join and the failure-diff work on cycle one.
-touch "$DONE" "$FAIL" "$PREV" "$POSTED"
+touch "$DONE" "$FAIL" "$PREV" "$POSTED" "$SEEN"
 TAB=$(printf '\t')
 # Lock is removed on exit; state is NOT (it must outlive every re-arm).
 trap '[ -n "${LOCK:-}" ] && rm -f "$LOCK"' EXIT
@@ -168,7 +186,11 @@ PR_FILTER='
 #     posted.ids) are our own words — echoing them back as "new comments" would
 #     be an instruction loop, not news.
 # Timestamps come back UTC ("...+00:00"); truncating both sides to seconds keeps
-# plain string comparison equivalent to time comparison here.
+# plain string comparison equivalent to time comparison here. Timestamps only
+# choose CANDIDATES — the caller hashes the body against seen.tsv and drops any
+# candidate whose text is unchanged, so a moved updated_on alone is not an event.
+# Rows: key <TAB> comment id <TAB> "author [on path] (kind, source)" <TAB>
+#       snippet <TAB> full body (single line, tab-free)
 COMMENT_FILTER='
   (._comments // [])[]
   | select((.deleted // false) | not)
@@ -180,11 +202,11 @@ COMMENT_FILTER='
   | (if ((.created_on // "")[0:19] > $last) then "new"
      elif ((.updated_on // "")[0:19] > $last) then "edited"
      else empty end) as $kind
-  | (if ($body | test("(?i)claude review|\\U0001F916")) then ", review-bot"
+  | (if ($body | test("(?i)claude review|\\x{1F916}")) then ", review-bot"
      elif ($body | test("NX_CLOUD_APP_COMMENT_END|cloud\\.nx\\.app|View your \\[CI Pipeline Execution")) then ", automation"
      elif ((.user.type // "") == "app_user") then ", app"
      else "" end) as $who
-  | "\($key)\t\(.user.display_name // "?")\(if .inline then " on \(.inline.path // "?")" else "" end) (\($kind)\($who))\t\($body | gsub("[\\r\\n\\t]+"; " ") | .[0:140])"
+  | "\($key)\t\($cid)\t\(.user.display_name // "?")\(if .inline then " on \(.inline.path // "?")" else "" end) (\($kind)\($who))\t\($body | gsub("[\\r\\n\\t]+"; " ") | .[0:140])\t\($body | gsub("[\\r\\n\\t]+"; " "))"
 '
 
 cycle=0
@@ -222,6 +244,7 @@ while true; do
 
   : > "$CUR"
   : > "$COLLECTED"
+  : > "$CAND"
   : > "$STATE_DIR/fail.new"
   for key in $keys; do
     wsrepo=${key%#*}
@@ -236,7 +259,7 @@ while true; do
       printf '%s\n' "$row" >> "$CUR"
       printf '%s' "$payload" | jq -r --arg key "$key" --arg last "$last" \
         --arg sig "$SIGNATURE" --arg posted "$posted" "$COMMENT_FILTER" \
-        >> "$COLLECTED" 2>/dev/null
+        >> "$CAND" 2>/dev/null
     else
       # Lookup failed (bad key, no access, twg not authenticated, API blip).
       # Carry the last known row forward so a blip can't fabricate a "new PR"
@@ -248,6 +271,31 @@ while true; do
     fi
   done
   sort -o "$CUR" "$CUR"
+
+  # Comment gate. Bitbucket moves updated_on for things that are not edits — a
+  # 👍 landing on an old comment, a re-index — so "updated_on > last" alone keeps
+  # firing (edited) on comments nobody changed. Hash each candidate's body and
+  # compare with what was last reported (seen.tsv): only changed text is news.
+  if [ -s "$CAND" ]; then
+    while IFS=$'\t' read -r ckey ccid clabel csnippet cbody; do
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ckey" "$ccid" "$(printf '%s' "$cbody" | hash_text)" "$clabel" "$csnippet"
+    done < "$CAND" > "$STATE_DIR/hash.new"
+    # NB: dispatch on FILENAME, not NR==FNR — SEEN is empty on the first cycle,
+    # and the NR==FNR idiom would then swallow every row of hash.new.
+    awk -F'\t' -v seen="$SEEN" '
+      FILENAME == seen { prev[$1 FS $2] = $3; next }
+      $3 != prev[$1 FS $2] { printf "%s\t%s\t%s\n", $1, $4, $5 }
+    ' "$SEEN" "$STATE_DIR/hash.new" >> "$COLLECTED"
+    # Newest hash wins per (pr, comment id); rows for PRs that left the watchlist
+    # are dropped so the map cannot grow without bound. NB: `keys` is newline
+    # separated and BSD awk rejects a newline in a -v value, so pass one line.
+    sort -s -t "$TAB" -k1,1 -k2,2n "$STATE_DIR/hash.new" "$SEEN" \
+      | awk -F'\t' -v k="$(printf '%s' "$keys" | tr '\n' ' ')" '
+          BEGIN { n = split(k, a, " "); for (i = 1; i <= n; i++) watched[a[i]] = 1 }
+          watched[$1] && !seen[$1 FS $2]++ { printf "%s\t%s\t%s\n", $1, $2, $3 }
+        ' > "$STATE_DIR/seen.new"
+    mv "$STATE_DIR/seen.new" "$SEEN"
+  fi
 
   # --- emit this cycle's events -------------------------------------------------
   # Newly watched PRs (in cur, not prev). PREV is empty on the very first cycle,

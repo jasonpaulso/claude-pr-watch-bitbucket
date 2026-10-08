@@ -63,12 +63,14 @@ Each entry inside a `COMMENTS` event is labelled `author (kind, source)`:
 | Label | Meaning | Treatment |
 | --- | --- | --- |
 | `(new)` | a human posted since the last check | judge by author |
-| `(edited)` | a human **edited** an existing comment — **this is news** | fetch and read it |
+| `(edited)` | a human **edited** an existing comment — the text really changed, not just Bitbucket's `updated_on` — **this is news** | fetch and read it |
 | `(new/edited, review-bot)` | an AI reviewer — the "🤖 Claude review", posted under *Bitbucket Pipelines* | treat exactly like a human reviewer: fix, refute with evidence, or track every finding |
 | `(new/edited, automation)` | automation notice posted under a **human** name (Nx Cloud "View your CI Pipeline Execution" links land as Brady Perry) | ignore |
 | `(new/edited, app)` | some other app/bot account | ignore unless unactioned |
 
 `edited` matters more than it looks: the CI Claude review edits its single comment rather than posting a new one, so a fresh finding arrives with an old `created_on` and a new `updated_on`. A watcher that only polled creation time would never surface it.
+
+Bitbucket also moves `updated_on` when nothing was written — a 👍 landing on an old comment, a re-index — so timestamps alone pick candidates, and each candidate's body is hashed against `<state>/seen.tsv`. A comment whose text matches what was already reported fires nothing; only changed text becomes an event.
 
 Comments ending in `-CC` are your own posted words and are filtered out, as are ids listed in `<state>/posted.ids` — otherwise Claude answers itself in a loop.
 

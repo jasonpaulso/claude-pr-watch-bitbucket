@@ -40,14 +40,14 @@ A COMMENTS event is grouped per PR with a count. Each entry is labelled
 | Label | What it is | Treatment |
 | --- | --- | --- |
 | `(new)` | a human posted since the last check | draft a reply where sensible |
-| `(edited)` | a human **edited** an existing comment | **this is news, not noise.** Fetch and read it. |
+| `(edited)` | a human **edited** an existing comment (text really changed, not just `updated_on`) | **this is news, not noise.** Fetch and read it. |
 | `(new/edited, review-bot)` | an AI reviewer — the "🤖 Claude review", posted under *Bitbucket Pipelines* | treat exactly like a human reviewer |
 | `(new/edited, automation)` | automation notice posted under a **human** name | ignore |
 | `(new/edited, app)` | some other app/bot account | ignore unless unactioned |
 
 Why the tags matter, concretely:
 
-- **Edited is a real channel.** The CI Claude review edits its single comment instead of posting a new one, so a fresh finding arrives as `(edited, review-bot)` with an old `created_on`. A watcher that only looked at creation times would never surface it. Same for the Nx Cloud comment.
+- **Edited is a real channel.** The CI Claude review edits its single comment instead of posting a new one, so a fresh finding arrives as `(edited, review-bot)` with an old `created_on`. A watcher that only looked at creation times would never surface it. Same for the Nx Cloud comment. Timestamps only pick candidates: each one's body is hashed against `<state>/seen.tsv`, so a moved `updated_on` with unchanged text fires nothing.
 - **`review-bot` is a reviewer, not noise.** The "🤖 Claude review" posted under *Bitbucket Pipelines* has caught genuine regressions. Every finding must be fixed, refuted with evidence, or tracked — never skipped because a bot wrote it.
 - **`automation` is not a human speaking.** Nx Cloud posts "View your [CI Pipeline Execution ↗](https://cloud.nx.app/...)" under **Brady Perry's** name, so it reads like review feedback from a person. It is automation: don't reply, don't act, unless nobody has dispositioned it.
 
