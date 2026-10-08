@@ -27,7 +27,7 @@ Watching *all* your open PRs sounds nice and is mostly noise: with dozens of PRs
 In Claude Code:
 
 ```
-/plugin marketplace add <owner>/claude-pr-watch-bitbucket
+/plugin marketplace add jasonpaulso/claude-pr-watch-bitbucket
 /plugin install bb-pr-watch@bb-pr-watch
 ```
 
@@ -110,6 +110,10 @@ Environment variables read by `scripts/watch-bb-pr-activity.sh`:
 - Comments beyond the hydration page of one `bb prs get --comments` call may report late — keep discussions under ~50 comments per PR.
 - Polling: comments/CI can lag up to one interval (~60s).
 - The Monitor's ceiling is 30 minutes, so a watch is a chain of re-arms, not one continuous process.
+
+## Credits
+
+Port of [`claude-pr-watch`](https://github.com/RobHannay/claude-pr-watch) (MIT) by **Rob Hannay** — the GitHub watcher this Bitbucket version is derived from. Same architecture (a `SessionStart` hook arms a per-session `Monitor` that polls and pushes events into the session); all forge access goes through the `twg` CLI instead of `gh`, and the polling, key format, CI rollup, and event taxonomy are rebuilt for Bitbucket Cloud.
 
 ## License
 
