@@ -10,7 +10,8 @@
 #                  (…, app) other automation; no suffix means a human.
 #                  (edited) means the comment TEXT changed since it was last
 #                  reported; a bare updated_on bump (a reaction, a re-index) is
-#                  gated out on a hash of the body — see COMMENT_FILTER.
+#                  gated out on a hash of the body — see COMMENT_FILTER and the
+#                  comment gate in the loop.
 #   APPROVALS    — the set of approvals on a PR changed (a reviewer signed off)
 #   CI           — the pipeline rollup on the PR's current tip changed
 #                  (passing / failing / pending / no-build)
@@ -36,9 +37,10 @@
 #   done.keys     merged/declined PRs, never looked at again
 #   fail.keys     lookups that failed last cycle (for once-per-streak notices)
 #   posted.ids    comment ids this session posted itself — never echoed back
-#   seen.tsv      key <TAB> comment id <TAB> hash of the comment text — the
-#                 baseline that says whether an (edited) event is real news or
-#                 just Bitbucket moving a timestamp
+#   seen.tsv      key <TAB> comment id <TAB> hash of the comment text, for
+#                 EVERY comment on the watched PRs (fingerprinted the first time
+#                 it is seen, silently) — this is what says whether an (edited)
+#                 event is real news or just Bitbucket moving a timestamp
 # Delete the state dir when you retire the watchlist; until then it survives
 # every re-arm.
 #
@@ -66,9 +68,10 @@ MAX_CYCLES="${WATCH_MAX_CYCLES:-0}"
 TWG="${WATCH_TWG:-twg}"
 TWG_ARGS="--output json --output-summary none"
 SIGNATURE="${WATCH_SIGNATURE:--CC}"
-# Content hash for the comment gate (see COMMENT_FILTER / the gate in the loop).
-# Only comment candidates get hashed — a handful per cycle — so spawning a hasher
-# per candidate costs nothing worth mentioning.
+# Content hash for the comment gate (see COMMENT_FILTER / the comment gate below).
+# Called once per comment that is either a candidate or not yet fingerprinted —
+# every comment once, then only the handful that move each cycle — so one process
+# per call is fine.
 if command -v md5sum >/dev/null 2>&1; then
   hash_text() { md5sum | cut -d' ' -f1; }
 elif command -v md5 >/dev/null 2>&1; then
@@ -176,7 +179,8 @@ PR_FILTER='
   | "\($key)\t\(.state)\t\($ci)\t\($appr)\t\(.title // "" | gsub("[\\r\\n\\t]+"; " ") | .[0:120])"
 '
 
-# Same payload -> comment rows: key <TAB> "author [on path] (kind, source)" <TAB> snippet
+# Same payload -> comment rows, one per live comment (see the row layout below the
+# two notes).
 #
 # Two things this must catch that a naive "created since last poll" does not:
 #   * EDITED comments. The CI Claude review edits its own comment instead of
@@ -186,11 +190,19 @@ PR_FILTER='
 #     posted.ids) are our own words — echoing them back as "new comments" would
 #     be an instruction loop, not news.
 # Timestamps come back UTC ("...+00:00"); truncating both sides to seconds keeps
-# plain string comparison equivalent to time comparison here. Timestamps only
-# choose CANDIDATES — the caller hashes the body against seen.tsv and drops any
-# candidate whose text is unchanged, so a moved updated_on alone is not an event.
-# Rows: key <TAB> comment id <TAB> "author [on path] (kind, source)" <TAB>
-#       snippet <TAB> full body (single line, tab-free)
+# plain string comparison equivalent to time comparison here.
+#
+# Every live comment is emitted, not only the recent ones: kind "-" marks the rows
+# that are not candidates (nothing happened to them since the last check), and the
+# comment gate in the loop fingerprints those silently. Emitting only candidates
+# would leave a comment that predates the watch without a baseline, so the first
+# 👍 it ever receives would read as "(edited)".
+# Rows: key <TAB> comment id <TAB> kind ("new" | "edited" | "-" = neither) <TAB>
+#       "author [on path] (kind, source)" <TAB> snippet <TAB> full body
+#       (single line, tab-free). kind is carried separately from the display
+#       label because the gate needs it to tell "report this" from "fingerprint
+#       this and say nothing", and "-" rather than "" because `IFS=$'\t' read`
+#       collapses runs of the delimiter and would shift every column after it.
 COMMENT_FILTER='
   (._comments // [])[]
   | select((.deleted // false) | not)
@@ -201,12 +213,12 @@ COMMENT_FILTER='
   | select(($body | endswith($sig)) | not)
   | (if ((.created_on // "")[0:19] > $last) then "new"
      elif ((.updated_on // "")[0:19] > $last) then "edited"
-     else empty end) as $kind
+     else "-" end) as $kind
   | (if ($body | test("(?i)claude review|\\x{1F916}")) then ", review-bot"
      elif ($body | test("NX_CLOUD_APP_COMMENT_END|cloud\\.nx\\.app|View your \\[CI Pipeline Execution")) then ", automation"
      elif ((.user.type // "") == "app_user") then ", app"
      else "" end) as $who
-  | "\($key)\t\($cid)\t\(.user.display_name // "?")\(if .inline then " on \(.inline.path // "?")" else "" end) (\($kind)\($who))\t\($body | gsub("[\\r\\n\\t]+"; " ") | .[0:140])\t\($body | gsub("[\\r\\n\\t]+"; " "))"
+  | "\($key)\t\($cid)\t\($kind)\t\(.user.display_name // "?")\(if .inline then " on \(.inline.path // "?")" else "" end) (\($kind)\($who))\t\($body | gsub("[\\r\\n\\t]+"; " ") | .[0:140])\t\($body | gsub("[\\r\\n\\t]+"; " "))"
 '
 
 cycle=0
@@ -272,19 +284,33 @@ while true; do
   done
   sort -o "$CUR" "$CUR"
 
-  # Comment gate. Bitbucket moves updated_on for things that are not edits — a
-  # 👍 landing on an old comment, a re-index — so "updated_on > last" alone keeps
-  # firing (edited) on comments nobody changed. Hash each candidate's body and
-  # compare with what was last reported (seen.tsv): only changed text is news.
+  # Comment gate. Two kinds of noise used to reach the session as COMMENTS:
+  #   * a comment nobody wrote to whose updated_on moved anyway (a 👍 landed on it,
+  #     a re-index) — "updated_on > last" alone fires (edited) on it forever;
+  #   * a comment that predates the watch, which fires (edited) the first time
+  #     anyone reacts to it, because nothing fingerprinted it when the watch began.
+  # So every comment on a watched PR is fingerprinted the first time it is seen,
+  # silently, and from then on a comment is news only when its text differs from
+  # the fingerprint in seen.tsv:
+  #   candidate (created/updated since the last check) -> report if the hash
+  #                                                         differs from seen.tsv
+  #   anything else                                      -> fingerprint if unknown,
+  #                                                         report nothing
   if [ -s "$CAND" ]; then
-    while IFS=$'\t' read -r ckey ccid clabel csnippet cbody; do
-      printf '%s\t%s\t%s\t%s\t%s\n' "$ckey" "$ccid" "$(printf '%s' "$cbody" | hash_text)" "$clabel" "$csnippet"
-    done < "$CAND" > "$STATE_DIR/hash.new"
+    # Trim rows that are neither candidates nor unknown — already fingerprinted
+    # and nothing moved. Keeps the hashing (one process per row) to a handful.
+    awk -F'\t' -v seen="$SEEN" '
+      FILENAME == seen { known[$1 FS $2] = 1; next }
+      $3 != "-" || !($1 FS $2 in known)
+    ' "$SEEN" "$CAND" > "$STATE_DIR/trim.raw"
+    while IFS=$'\t' read -r ckey ccid ckind clabel csnippet cbody; do
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ckey" "$ccid" "$(printf '%s' "$cbody" | hash_text)" "$ckind" "$clabel" "$csnippet"
+    done < "$STATE_DIR/trim.raw" > "$STATE_DIR/hash.new"
     # NB: dispatch on FILENAME, not NR==FNR — SEEN is empty on the first cycle,
     # and the NR==FNR idiom would then swallow every row of hash.new.
     awk -F'\t' -v seen="$SEEN" '
       FILENAME == seen { prev[$1 FS $2] = $3; next }
-      $3 != prev[$1 FS $2] { printf "%s\t%s\t%s\n", $1, $4, $5 }
+      $4 != "-" && $3 != prev[$1 FS $2] { printf "%s\t%s\t%s\n", $1, $5, $6 }
     ' "$SEEN" "$STATE_DIR/hash.new" >> "$COLLECTED"
     # Newest hash wins per (pr, comment id); rows for PRs that left the watchlist
     # are dropped so the map cannot grow without bound. NB: `keys` is newline

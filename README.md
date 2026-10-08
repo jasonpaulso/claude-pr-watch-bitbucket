@@ -70,7 +70,7 @@ Each entry inside a `COMMENTS` event is labelled `author (kind, source)`:
 
 `edited` matters more than it looks: the CI Claude review edits its single comment rather than posting a new one, so a fresh finding arrives with an old `created_on` and a new `updated_on`. A watcher that only polled creation time would never surface it.
 
-Bitbucket also moves `updated_on` when nothing was written — a 👍 landing on an old comment, a re-index — so timestamps alone pick candidates, and each candidate's body is hashed against `<state>/seen.tsv`. A comment whose text matches what was already reported fires nothing; only changed text becomes an event.
+Bitbucket also moves `updated_on` when nothing was written — a 👍 landing on an old comment, a re-index. So timestamps only pick **candidates**; every comment is fingerprinted (a hash of its body) the first time the watcher sees it, into `<state>/seen.tsv`, and a candidate fires only when its text differs from that fingerprint. Comments that predate the watch are fingerprinted silently, so the first reaction to an old comment is not reported as an edit.
 
 Comments ending in `-CC` are your own posted words and are filtered out, as are ids listed in `<state>/posted.ids` — otherwise Claude answers itself in a loop.
 
