@@ -90,9 +90,9 @@ max_rowid() { "$SQLITE" "$1" 'SELECT max(rowid) FROM events'; }
 cmt() {  # id created updated body user type
   printf '{"id":%s,"created_on":"%s","updated_on":"%s","content":{"raw":"%s"},"user":{"display_name":"%s","type":"%s"}}' "$@"
 }
-pr_json() {  # state tip statuses comments reviewers title
-  printf '{"state":"%s","title":"%s","source":{"commit":{"hash":"%s"}},"reviewers":%s,"_statuses":%s,"_comments":%s}\n' \
-    "$1" "$6" "$2" "$5" "$3" "$4"
+pr_json() {  # state tip statuses comments reviewers title [participants]
+  printf '{"state":"%s","title":"%s","source":{"commit":{"hash":"%s"}},"reviewers":%s,"participants":%s,"_statuses":%s,"_comments":%s}\n' \
+    "$1" "$6" "$2" "$5" "${7:-[]}" "$3" "$4"
 }
 simple_pr() { pr_json OPEN "$TIP" '[]' '[]' '[]' "Trip planner" > "$1/$2.json"; }
 # Four cycles that exercise every output line: WATCHING, COMMENTS (new, edited,
@@ -106,11 +106,14 @@ fixtures_all_events() {
   c11=$(cmt 11 2099-01-01T00:00:00+00:00 2099-01-01T00:00:00+00:00 'Claude review: looks fine' 'Bitbucket Pipelines' app_user)
   c12=$(cmt 12 2099-01-01T00:00:00+00:00 2099-01-01T00:00:00+00:00 'done -CC' 'Claude' user)
   c13=$(cmt 13 2099-01-01T00:00:00+00:00 2099-01-01T00:00:00+00:00 'View your [CI Pipeline Execution](https://cloud.nx.app/x)' 'Brady Perry' user)
+  # The approval sits in both places here: 0.2.4 read reviewers, 0.2.5 reads participants,
+  # and this case compares their output byte for byte. case10 uses Bitbucket's real shape.
   appr='[{"approved":true,"display_name":"Brady Perry"}]'
+  part='[{"role":"REVIEWER","approved":true,"user":{"display_name":"Brady Perry"}}]'
   pr_json OPEN "$TIP" "$(st IN_PROGRESS)" "[$c10]" '[]' 'Add trip planner' > "$f/1512.1.json"
-  pr_json OPEN "$TIP" "$(st FAILED)" "[$c10e,$c11]" "$appr" 'Add trip planner' > "$f/1512.2.json"
-  pr_json OPEN "$TIP" "$(st SUCCESSFUL)" "[$c10e,$c11,$c12,$c13]" "$appr" 'Add trip planner' > "$f/1512.3.json"
-  pr_json MERGED "$TIP" "$(st SUCCESSFUL)" "[$c10e,$c11,$c12,$c13]" "$appr" 'Add trip planner' > "$f/1512.4.json"
+  pr_json OPEN "$TIP" "$(st FAILED)" "[$c10e,$c11]" "$appr" 'Add trip planner' "$part" > "$f/1512.2.json"
+  pr_json OPEN "$TIP" "$(st SUCCESSFUL)" "[$c10e,$c11,$c12,$c13]" "$appr" 'Add trip planner' "$part" > "$f/1512.3.json"
+  pr_json MERGED "$TIP" "$(st SUCCESSFUL)" "[$c10e,$c11,$c12,$c13]" "$appr" 'Add trip planner' "$part" > "$f/1512.4.json"
   pr_json OPEN 2222222222aa '[]' '[]' '[]' 'Fix login' > "$f/1513.1.json"
   echo '{"error":{"message":"boom"}}' > "$f/1513.2.json"
   pr_json OPEN 2222222222aa '[]' '[]' '[]' 'Fix login' > "$f/1513.3.json"
@@ -385,6 +388,28 @@ job_case6_resume() {
   chk "re-arm sent no second WATCHING" t_lacks "$D/out2" WATCHING
   chk "re-arm resumed from last: the comment from the gap arrives" t_has "$D/out2" 'COMMENTS busie/fe-main#1512 — 1 new: Brady Perry (new): looks wrong to me'
 }
+# Bitbucket's real shape (RC #1511, PR #1512 on 2026-10-21): reviewers carry no `approved`;
+# approvals are on participants, as REVIEWER or PARTICIPANT. 0.2.4 never saw them.
+job_case10_approvals() {
+  setup; echo busie/fe-main#1512 > "$LIST"
+  rev='[{"display_name":"Brady Perry","nickname":"Brady"}]'
+  none='[{"role":"REVIEWER","approved":false,"user":{"display_name":"Brady Perry"}},{"role":"PARTICIPANT","approved":false,"user":{"display_name":"Bitbucket Pipelines"}}]'
+  both='[{"role":"PARTICIPANT","approved":true,"user":{"display_name":"Jason Schulz"}},{"role":"PARTICIPANT","approved":false,"user":{"display_name":"Bitbucket Pipelines"}},{"role":"REVIEWER","approved":true,"user":{"display_name":"Brady Perry"}}]'
+  pr_json OPEN "$TIP" '[]' '[]' "$rev" 'Trip planner' "$none" > "$FIX/1512.1.json"
+  pr_json OPEN "$TIP" '[]' '[]' "$rev" 'Trip planner' "$both" > "$FIX/1512.2.json"
+  mkdir -p "$D/old/fix"; cp "$FIX"/*.json "$D/old/fix/"; cp "$LIST" "$D/old/w.watchlist"
+  export WATCH_EVENTS=0 WATCH_INTERVAL=1 WATCH_MAX_CYCLES=2
+  (
+    export WATCH_LIST=$D/old/w.watchlist FIXDIR=$D/old/fix
+    FIX=$D/old/fix launch "$T/old/watch-bb-pr-activity.sh" "$D/old/out" "$D/old/err" "$D/old/rc"
+  )
+  launch "$NEW" "$D/out" "$D/err" "$D/rc"
+  wait_rc "$D/rc" 20 || { bail "watcher did not finish"; return; }
+  wait_rc "$D/old/rc" 20 || bail "0.2.4 run did not finish"
+  chk "approvals on participants are reported, both roles, sorted" t_has "$D/out" 'APPROVALS: busie/fe-main#1512 — approved by Brady Perry, Jason Schulz — Trip planner'
+  chk "an unapproved participant is not listed" t_lacks "$D/out" 'Bitbucket Pipelines'
+  chk "0.2.4 missed the same approvals (the bug this fixes)" t_lacks "$D/old/out" 'APPROVALS'
+}
 job_case6_maxcycles() {
   setup; echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
   export WATCH_INTERVAL=1 WATCH_MAX_CYCLES=3 WATCH_DEBUG=1
@@ -452,7 +477,7 @@ mkdir "$T/old" "$T/res"
 git -C "$ROOT" show "$BASE_SHA:plugins/bb-pr-watch/scripts/watch-bb-pr-activity.sh" > "$T/old/watch-bb-pr-activity.sh" \
   || { echo "cannot read the 0.2.4 script at $BASE_SHA"; exit 1; }
 
-JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off"
+JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off case10_approvals"
 for j in $JOBS; do
   ( JOB=$j; "job_$j"; echo "DONE: $j" ) > "$T/res/$j.txt" 2>&1 &
 done

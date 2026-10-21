@@ -203,8 +203,10 @@ PR_FILTER='
      elif ($s | any(. == "IN_PROGRESS" or . == "BUILDING" or . == "PENDING"
                    or . == "HALTED" or . == "QUEUED" or . == "IN_QUEUE")) then "pending"
      else "passing" end) as $ci
-  | ([.reviewers[]? | select(.approved == true)
-     | (.display_name // .nickname // "?")] | unique | join(", ")) as $appr
+  # Approvals live on participants, whatever their role: the Bitbucket reviewers list carries
+  # names only, never `approved` (RC #1511: Brady approved as REVIEWER, Jason as PARTICIPANT).
+  | ([.participants[]? | select(.approved == true)
+     | (.user.display_name // .user.nickname // "?")] | unique | join(", ")) as $appr
   | "\($key)\t\(.state)\t\($ci)\t\($appr)\t\(.title // "" | gsub("[\\r\\n\\t]+"; " ") | .[0:120])"
 '
 
