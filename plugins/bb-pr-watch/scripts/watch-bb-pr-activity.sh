@@ -59,21 +59,26 @@
 # THE WAIT BETWEEN CYCLES
 # -----------------------
 # Polling stays the source of truth; an event only makes the next poll earlier.
-# The wait ticks every 2 s and ends at the first of:
-#   interval   WATCH_INTERVAL (default 60 s) since the previous cycle started, so
-#              the watcher is never slower than a plain sleep would make it
+# Event mode needs WATCH_EVENTS != 0, the DB at WATCH_EVENT_DB and sqlite3 on
+# PATH. Without it the wait is a plain `sleep $WATCH_INTERVAL` after the cycle,
+# exactly as before (and a watchlist change waits for the next poll). With it,
+# the wait ticks every 2 s and ends at the first of:
+#   interval   WATCH_INTERVAL (default 60 s) after the previous cycle ENDED, to
+#              within a second early (bash's clock is whole seconds), never late
 #   watchlist  the watchlist file's size or mtime changed (a PR was added/removed)
 #   event      webhook-receiver logged a row for a watched PR past event.rowid:
 #              a pullrequest:* event naming it, or a commit status on its tip
 # watchlist and event wakes come no sooner than 5 s after the previous cycle
-# started, and an event waits 3 s more so a burst becomes one cycle. Event
-# mode needs WATCH_EVENTS != 0, the DB at WATCH_EVENT_DB and sqlite3 on PATH;
-# any failed read counts as "no event", so the worst case is the plain poll.
+# ended, and an event waits 3 s more so a burst becomes one cycle. A read of the
+# log can block 2 s on a locked DB, so none starts with under ~3 s of the
+# interval left and the wait never overruns the interval by more than the 0.3 s
+# the closing read may take. Any failed read counts as "no event", so the worst
+# case is the plain poll.
 #
 # Env overrides (for testing): WATCH_INTERVAL, WATCH_MAX_CYCLES (0 = forever),
 # WATCH_STATE_DIR, WATCH_SINCE (comment floor), WATCH_TWG, WATCH_SIGNATURE
 # (the signature your own posted comments end with; default "-CC"),
-# WATCH_EVENTS (0 = never wake early), WATCH_EVENT_DB (default
+# WATCH_EVENTS (0 = plain sleep, never wake early), WATCH_EVENT_DB (default
 # ~/.local/share/webhook-receiver/events.sqlite), WATCH_DEBUG (1 = log each
 # wait's reason and length to stderr).
 set -u
@@ -256,22 +261,31 @@ fi
 event_on() {
   [ "${WATCH_EVENTS:-1}" != 0 ] && [ -f "$EVENT_DB" ] && command -v sqlite3 >/dev/null 2>&1
 }
-# Every read is read-only with a 2 s busy timeout. A failure (locked, unreadable,
-# not a database) prints nothing, which every caller treats as "no match".
+# Every read is read-only with a busy timeout (default 2 s). A failure (locked,
+# unreadable, not a database) prints nothing, which every caller treats as "no match".
 event_sql() {
-  sqlite3 -readonly -cmd '.timeout 2000' "$EVENT_DB" "$1" 2>/dev/null </dev/null
+  sqlite3 -readonly -cmd ".timeout ${2:-2000}" "$EVENT_DB" "$1" 2>/dev/null </dev/null
 }
-# Remember the newest rowid. A failed read leaves the saved value as it was.
+# Remember the newest rowid, in memory as well as in the file: if the file cannot
+# be written, the same row must not wake every later wait. A failed read leaves
+# the saved value as it was. $1 = busy timeout in ms.
+ROWID_MEM=""
 save_rowid() {
-  ev_max=$(event_sql 'SELECT coalesce(max(rowid), 0) FROM events')
-  case "$ev_max" in ''|*[!0-9]*) ;; *) printf '%s\n' "$ev_max" > "$ROWIDF" ;; esac
+  ev_max=$(event_sql 'SELECT coalesce(max(rowid), 0) FROM events' "${1:-2000}")
+  case "$ev_max" in
+    ''|*[!0-9]*) ;;
+    *) ROWID_MEM=$ev_max; printf '%s\n' "$ev_max" 2>/dev/null > "$ROWIDF" ;;
+  esac
 }
 # SQL that finds a row past the saved rowid that concerns a watched PR, or ""
 # when there is nothing to match. Watched = this cycle's keys minus merged ones;
 # keys and tips only reach SQL as quoted literals (single quotes doubled).
 event_query() {
   ev_saved=$(cat "$ROWIDF" 2>/dev/null)
-  case "$ev_saved" in ''|*[!0-9]*) return ;; esac
+  case "$ev_saved" in ''|*[!0-9]*) ev_saved="" ;; esac
+  # The larger of file and memory: a file that could not be updated is stale.
+  if [ -n "$ROWID_MEM" ] && { [ -z "$ev_saved" ] || [ "$ROWID_MEM" -gt "$ev_saved" ]; }; then ev_saved=$ROWID_MEM; fi
+  [ -z "$ev_saved" ] && return
   ev_watched=$(printf '%s\n' "$keys" | grep -vxF -f "$DONE")
   [ -z "$ev_watched" ] && return
   ev_prs=$(printf '%s\n' "$ev_watched" | awk -v q="'" \
@@ -291,37 +305,43 @@ event_query() {
           AND substr(json_extract(payload, '\$.commit_status.commit.hash'), 1, length(s.t)) = s.t))
     ) LIMIT 1"
 }
-# Block until it is time for the next cycle; logs why when WATCH_DEBUG=1.
+# Block until it is time for the next cycle; logs why when WATCH_DEBUG=1. Time
+# is measured from the moment this is called, i.e. from the end of the cycle, so
+# a cycle longer than the interval is never followed by an immediate one.
 wait_for_wake() {
   wf_t0=$SECONDS
   wf_reason=interval
-  case "$INTERVAL" in
-    ''|*[!0-9]*) sleep "$INTERVAL" ;;   # not whole seconds: a plain sleep, as before
-    *)
-      wf_query=""
-      event_on && wf_query=$(event_query)
-      while :; do
-        wf_el=$((SECONDS - CYCLE_START))
-        [ "$wf_el" -ge "$INTERVAL" ] && break
-        if [ "$wf_el" -ge 5 ]; then
-          if [ "$(list_sig)" != "$LIST_SIG" ]; then wf_reason=watchlist; break; fi
-          if [ -n "$wf_query" ] && [ -n "$(event_sql "$wf_query")" ]; then
-            wf_reason=event
-            # Let a burst of events land in one cycle, but never run past the interval.
-            wf_rem=$((INTERVAL - wf_el))
-            sleep $((wf_rem < 3 ? wf_rem : 3))
-            break
-          fi
+  wf_ev=0
+  case "$INTERVAL" in ''|*[!0-9]*) ;; *) event_on && wf_ev=1 ;; esac
+  if [ "$wf_ev" = 0 ]; then
+    sleep "$INTERVAL"   # event mode off: the wait is what it always was
+  else
+    wf_query=$(event_query)
+    while :; do
+      wf_el=$((SECONDS - wf_t0))
+      [ "$wf_el" -ge "$INTERVAL" ] && break
+      if [ "$wf_el" -ge 5 ]; then
+        if [ "$(list_sig)" != "$LIST_SIG" ]; then wf_reason=watchlist; break; fi
+        # A read may block 2 s: only start one with a clear margin left.
+        if [ -n "$wf_query" ] && [ $((INTERVAL - wf_el)) -ge 4 ] && [ -n "$(event_sql "$wf_query")" ]; then
+          wf_reason=event
+          # Let a burst of events land in one cycle, but stay inside the interval.
+          wf_rem=$((INTERVAL - (SECONDS - wf_t0)))
+          [ "$wf_rem" -ge 2 ] && sleep $((wf_rem - 1 < 3 ? wf_rem - 1 : 3))
+          break
         fi
-        wf_rem=$((INTERVAL - wf_el))
-        sleep $((wf_rem < 2 ? wf_rem : 2))
-      done
-      # Every wake saves the newest rowid before the cycle's twg calls: a row
-      # logged during the cycle then wakes the next wait, and rows from before
-      # this moment can never wake a PR that is added later.
-      event_on && save_rowid
-      ;;
-  esac
+      fi
+      # Sleep to just short of the deadline, then creep up on it: the clock is in
+      # whole seconds, so a full sleep could land up to a second past it.
+      wf_rem=$((INTERVAL - (SECONDS - wf_t0)))
+      if [ "$wf_rem" -ge 2 ]; then sleep $((wf_rem - 1 < 2 ? wf_rem - 1 : 2)); else sleep 0.2; fi
+    done
+    # Every wake saves the newest rowid before the cycle's twg calls: a row
+    # logged during the cycle then wakes the next wait, and rows from before
+    # this moment can never wake a PR that is added later. Short timeout: this
+    # read happens at the deadline.
+    save_rowid 300
+  fi
   [ "${WATCH_DEBUG:-0}" = 1 ] && echo "bb-pr-watch: wait reason=$wf_reason secs=$((SECONDS - wf_t0))" >&2
   return 0
 }
@@ -332,7 +352,6 @@ if [ ! -s "$ROWIDF" ] && event_on; then save_rowid; fi
 cycle=0
 while true; do
   [ "$cycle" -gt 0 ] && wait_for_wake
-  CYCLE_START=$SECONDS
   cycle=$((cycle + 1))
   now=$(date -u +%Y-%m-%dT%H:%M:%S)
 

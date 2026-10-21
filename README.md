@@ -100,11 +100,11 @@ Environment variables read by `scripts/watch-bb-pr-activity.sh`:
 | `WATCH_SINCE` | the stored `last`, else now | ISO-8601 UTC floor for comments — set in the past to replay recent discussion |
 | `WATCH_TWG` | `twg` | Path to the `twg` binary |
 | `WATCH_SIGNATURE` | `-CC` | Signature your own posted comments end with; those are filtered out |
-| `WATCH_EVENTS` | on | `0` turns off the early wake described below; the watcher then polls every `WATCH_INTERVAL` exactly as before |
+| `WATCH_EVENTS` | on | `0` turns the early wake off: the wait between cycles is then a plain `sleep` of `WATCH_INTERVAL` after each cycle, exactly as in 0.2.4, and a watchlist change is picked up at the next poll. The early wake is also off when `sqlite3` is not on `PATH` or `WATCH_EVENT_DB` does not exist |
 | `WATCH_EVENT_DB` | `~/.local/share/webhook-receiver/events.sqlite` | The webhook-receiver event log the early wake reads (read-only) |
 | `WATCH_DEBUG` | off | `1` logs why each wait ended (`interval`, `watchlist` or `event`) and how long it lasted, to stderr |
 
-**Early wake.** Polling stays the source of truth; an event only makes the next poll earlier. If `sqlite3` is on `PATH` and the webhook-receiver log exists, the wait between cycles ends early when a PR is added to the watchlist, or when the log gets a `pullrequest:*` row for a watched PR or a commit status on its tip, but never sooner than 5 s after the previous cycle started (events wait 3 s more, so a burst is one cycle). Any failed read of the log counts as "no event", so the worst case is the plain `WATCH_INTERVAL` poll.
+**Early wake.** Polling stays the source of truth; an event only makes the next poll earlier. When the early wake is on (see `WATCH_EVENTS`), the wait after each cycle ends at `WATCH_INTERVAL`, as always, or sooner when a PR is added to or removed from the watchlist, or when the webhook-receiver log gets a `pullrequest:*` row for a watched PR or a commit status on its tip. An early wake never comes sooner than 5 s after the previous cycle ended (an event waits 3 s more, so a burst is one cycle), and the wait never runs past `WATCH_INTERVAL` by more than a fraction of a second even if the log is locked. Any failed read of the log counts as "no event", so the worst case is the plain poll.
 
 `BB_HOST_PATTERN` (read by the SessionStart hook) sets which git remote host counts as Bitbucket when auto-seeding — default `bitbucket`; set it to your Bitbucket Server hostname if you self-host.
 

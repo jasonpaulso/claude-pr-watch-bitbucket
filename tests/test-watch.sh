@@ -143,6 +143,7 @@ wait_text() {  # file text seconds
 call_at() { sed -n "${1}p" "$FIX/calls.log" | cut -d' ' -f1; }
 gap() { echo $(($(call_at "$2") - $(call_at "$1"))); }          # seconds between two calls
 reasons() { sed -n 's/^bb-pr-watch: wait reason=\([a-z]*\) .*/\1/p' "$1" | tr '\n' ' '; }
+max_secs() { sed -n 's/^bb-pr-watch: wait reason=[a-z]* secs=\([0-9]*\)$/\1/p' "$1" | sort -n | tail -1; }
 lock_pid() { cat "$LIST.lock" 2>/dev/null; }
 
 # Per-job sandbox: $D dir, $FIX fixtures, $DB event DB, $LIST watchlist.
@@ -194,6 +195,12 @@ case1() {  # variant
       exec 9>"$D/hold"; echo 'BEGIN EXCLUSIVE;' >&9; sleep 0.5
       chk "fixture DB is really locked" sh -c "! $SQLITE -readonly -cmd '.timeout 200' '$DB' 'SELECT 1 FROM events' >/dev/null 2>&1"
       export WATCH_EVENT_DB=$DB; n=2 iv=6 ;;
+    locked60)
+      seed_db "$DB"; echo 0 > "$D/w.state/event.rowid"; seeded=0
+      mkfifo "$D/hold"; "$SQLITE" "$DB" < "$D/hold" >/dev/null 2>&1 &
+      exec 9>"$D/hold"; echo 'BEGIN EXCLUSIVE;' >&9; sleep 0.5
+      chk "fixture DB is really locked" sh -c "! $SQLITE -readonly -cmd '.timeout 200' '$DB' 'SELECT 1 FROM events' >/dev/null 2>&1"
+      export WATCH_EVENT_DB=$DB; n=2 iv=60 ;;
     unreadable)
       seed_db "$DB"; echo 0 > "$D/w.state/event.rowid"; seeded=0
       chmod 000 "$DB"
@@ -221,11 +228,16 @@ case1() {  # variant
   fi
   wait_rc "$D/old/rc" 60 || bail "0.2.4 run did not finish"
   wait_rc "$D/rc" 90 || { bail "watcher did not reach WATCH_MAX_CYCLES"; return; }
-  [ "$1" = locked ] && exec 9>&-
+  case $1 in locked*) exec 9>&- ;; esac
   chk "[$1] exits 0 at WATCH_MAX_CYCLES" t_eq "$(cat "$D/rc")" 0
   chk "[$1] polled every PR every cycle" t_eq "$(ncalls)" $((n * npr))
   chk "[$1] output equals 0.2.4's" t_same "$D/old/out" "$D/out"
   chk "[$1] every wait ended by interval" t_eq "$(reasons "$D/err")" "$(i=1; while [ $i -lt $n ]; do printf 'interval '; i=$((i + 1)); done)"
+  # The 2 s busy timeout of a locked DB must not stretch the wait (verifier: 6 -> 8 s, 60 -> 62 s).
+  chk "[$1] longest wait <= WATCH_INTERVAL + 1 s (measured $(max_secs "$D/err") s of $iv)" t_between "$(max_secs "$D/err")" 0 $((iv + 1))
+  case $1 in locked*|unreadable)
+    chk "[$1] cycle-to-cycle gap within WATCH_INTERVAL -1..+1 s" t_between "$(gap 2 3)" $((iv - 1)) $((iv + 1)) ;;
+  esac
   if [ -n "$seeded" ]; then
     chk "[$1] saved rowid untouched by failed or disabled reads" t_eq "$(cat "$D/w.state/event.rowid")" 0
   fi
@@ -240,6 +252,7 @@ case1() {  # variant
 job_case1_nodb()        { case1 nodb; }
 job_case1_off()         { case1 off; }
 job_case1_locked()      { case1 locked; }
+job_case1_locked60()     { case1 locked60; }
 job_case1_unreadable()  { case1 unreadable; }
 job_case1_nosqlite()    { case1 nosqlite; }
 
@@ -340,8 +353,10 @@ job_case5_rearm() {
 
 # Case 6: regressions. DUPLICATE lock exit; resume from last/prev.tsv; MAX_CYCLES.
 job_case6_duplicate() {
-  setup; echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
-  export WATCH_INTERVAL=600
+  setup; seed_db "$DB"; echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
+  # Event mode on: it ticks, so TERM is handled within 2 s. With it off the wait is
+  # a plain `sleep`, which (as in 0.2.4) holds the TERM trap until it ends.
+  export WATCH_EVENT_DB=$DB WATCH_INTERVAL=600
   launch "$NEW" "$D/outA" "$D/errA" "$D/rcA"
   wait_calls 1 15 || { bail "watcher A made no cycle"; return; }
   a=$(lock_pid)
@@ -379,12 +394,65 @@ job_case6_maxcycles() {
   chk "default event DB path never read: waits ended by interval" t_eq "$(reasons "$D/err")" "interval interval "
 }
 
+# Case 7: with event mode off (WATCH_EVENTS=0, or no DB) the wait is the plain
+# 0.2.4 sleep: a watchlist append mid-wait does NOT end it early.
+case7() {  # variant
+  setup; seed_db "$DB"
+  echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512; simple_pr "$FIX" 1513
+  case $1 in
+    off)  export WATCH_EVENT_DB=$DB WATCH_EVENTS=0 ;;
+    nodb) export WATCH_EVENT_DB=$D/missing.sqlite ;;
+  esac
+  export WATCH_INTERVAL=12 WATCH_MAX_CYCLES=2 WATCH_DEBUG=1
+  launch "$NEW" "$D/out" "$D/err" "$D/rc"
+  wait_calls 1 15 || { bail "no first cycle"; return; }
+  echo busie/fe-main#1513 >> "$LIST"
+  wait_rc "$D/rc" 30 || { bail "did not finish"; return; }
+  chk "[$1] append mid-wait did not end the wait early" t_eq "$(reasons "$D/err")" "interval "
+  chk "[$1] the wait lasted the whole interval" t_between "$(gap 1 2)" 12 13
+  chk "[$1] the added PR is picked up at the next poll" t_has "$D/out" 'WATCHING: busie/fe-main#1513'
+}
+job_case7_off()  { case7 off; }
+job_case7_nodb() { case7 nodb; }
+
+# Case 8: when event.rowid cannot be written, the row that caused a wake must
+# not wake every later wait (the last-seen rowid is also kept in memory).
+job_case8_rowid_memory() {
+  setup; seed_db "$DB"
+  echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
+  mkdir -p "$D/w.state"; max_rowid "$DB" > "$D/w.state/event.rowid"; chmod 444 "$D/w.state/event.rowid"
+  seeded=$(cat "$D/w.state/event.rowid")
+  chk "fixture rowid file is really unwritable" sh -c "! (echo x 2>/dev/null > '$D/w.state/event.rowid')"
+  export WATCH_EVENT_DB=$DB WATCH_INTERVAL=14 WATCH_MAX_CYCLES=3 WATCH_DEBUG=1 FAKE_DB=$DB FAKE_PAYLOAD="$(pr_ev 1512 busie/fe-main)"
+  export FAKE_HOOK='[ "$c" = 1 ] && "$INS" "$FAKE_DB" pullrequest:comment_created busie/fe-main "$FAKE_PAYLOAD"'
+  launch "$NEW" "$D/out" "$D/err" "$D/rc"
+  wait_rc "$D/rc" 60 || { bail "did not finish"; return; }
+  chk "one event wake, then no re-wake from the same row" t_eq "$(reasons "$D/err")" "event interval "
+  chk "the rowid file really stayed stale" t_eq "$(cat "$D/w.state/event.rowid")" "$seeded"
+}
+
+# Case 9: a cycle longer than the interval is never followed by an immediate
+# one: the interval counts from the end of the cycle (3 s cycle, 3 s interval).
+case9() {  # variant
+  setup; seed_db "$DB"
+  echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
+  export WATCH_EVENT_DB=$DB WATCH_INTERVAL=3 WATCH_MAX_CYCLES=3 WATCH_DEBUG=1 FAKE_HOOK='sleep 3'
+  [ "$1" = off ] && export WATCH_EVENTS=0
+  launch "$NEW" "$D/out" "$D/err" "$D/rc"
+  wait_rc "$D/rc" 60 || { bail "did not finish"; return; }
+  # 3 s cycle + >= 2 s wait; back-to-back polling would show 3.
+  chk "[$1] cycle starts are at least a cycle plus most of an interval apart" t_between "$(gap 1 2)" 4 8
+  chk "[$1] ...every time" t_between "$(gap 2 3)" 4 8
+}
+job_case9_longcycle_on()  { case9 on; }
+job_case9_longcycle_off() { case9 off; }
+
 # ---- run -----------------------------------------------------------------------
 mkdir "$T/old" "$T/res"
 git -C "$ROOT" show "$BASE_SHA:plugins/bb-pr-watch/scripts/watch-bb-pr-activity.sh" > "$T/old/watch-bb-pr-activity.sh" \
   || { echo "cannot read the 0.2.4 script at $BASE_SHA"; exit 1; }
 
-JOBS="syntax case1_nodb case1_off case1_locked case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles"
+JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off"
 for j in $JOBS; do
   ( JOB=$j; "job_$j"; echo "DONE: $j" ) > "$T/res/$j.txt" 2>&1 &
 done
