@@ -41,6 +41,10 @@
 #                 EVERY comment on the watched PRs (fingerprinted the first time
 #                 it is seen, silently) — this is what says whether an (edited)
 #                 event is real news or just Bitbucket moving a timestamp
+#   tips.tsv      key <TAB> source.commit.hash of every watched PR's tip, rewritten
+#                 each cycle from the payload already fetched (the wait below
+#                 matches commit statuses against it)
+#   event.rowid   the highest webhook-receiver row already accounted for
 # Delete the state dir when you retire the watchlist; until then it survives
 # every re-arm.
 #
@@ -52,9 +56,26 @@
 # and twg writes no per-run payload file, which a long-lived poller would
 # otherwise accumulate by the thousand.
 #
+# THE WAIT BETWEEN CYCLES
+# -----------------------
+# Polling stays the source of truth; an event only makes the next poll earlier.
+# The wait ticks every 2 s and ends at the first of:
+#   interval   WATCH_INTERVAL (default 60 s) since the previous cycle started, so
+#              the watcher is never slower than a plain sleep would make it
+#   watchlist  the watchlist file's size or mtime changed (a PR was added/removed)
+#   event      webhook-receiver logged a row for a watched PR past event.rowid:
+#              a pullrequest:* event naming it, or a commit status on its tip
+# watchlist and event wakes come no sooner than 5 s after the previous cycle
+# started, and an event waits 3 s more so a burst becomes one cycle. Event
+# mode needs WATCH_EVENTS != 0, the DB at WATCH_EVENT_DB and sqlite3 on PATH;
+# any failed read counts as "no event", so the worst case is the plain poll.
+#
 # Env overrides (for testing): WATCH_INTERVAL, WATCH_MAX_CYCLES (0 = forever),
 # WATCH_STATE_DIR, WATCH_SINCE (comment floor), WATCH_TWG, WATCH_SIGNATURE
-# (the signature your own posted comments end with; default "-CC").
+# (the signature your own posted comments end with; default "-CC"),
+# WATCH_EVENTS (0 = never wake early), WATCH_EVENT_DB (default
+# ~/.local/share/webhook-receiver/events.sqlite), WATCH_DEBUG (1 = log each
+# wait's reason and length to stderr).
 set -u
 
 # Byte-wise collation everywhere: `sort` and `join` must agree, and the keys are
@@ -96,8 +117,11 @@ POSTED="$STATE_DIR/posted.ids"   # comment ids this session posted — never ech
 SEEN="$STATE_DIR/seen.tsv"       # key <TAB> comment id <TAB> hash of the comment text
 COLLECTED="$STATE_DIR/comments.tsv"
 CAND="$STATE_DIR/cand.raw"       # this cycle's comment candidates, pre-gate
+TIPS="$STATE_DIR/tips.tsv"       # key <TAB> tip commit hash of each watched PR
+ROWIDF="$STATE_DIR/event.rowid"  # newest event-log rowid already accounted for
+EVENT_DB="${WATCH_EVENT_DB:-${HOME:-}/.local/share/webhook-receiver/events.sqlite}"
 # PREV/FAIL must exist (empty) so join and the failure-diff work on cycle one.
-touch "$DONE" "$FAIL" "$PREV" "$POSTED" "$SEEN"
+touch "$DONE" "$FAIL" "$PREV" "$POSTED" "$SEEN" "$TIPS"
 TAB=$(printf '\t')
 # Lock is removed on exit; state is NOT (it must outlive every re-arm).
 trap '[ -n "${LOCK:-}" ] && rm -f "$LOCK"' EXIT
@@ -221,9 +245,94 @@ COMMENT_FILTER='
   | "\($key)\t\($cid)\t\($kind)\t\(.user.display_name // "?")\(if .inline then " on \(.inline.path // "?")" else "" end) (\($kind)\($who))\t\($body | gsub("[\\r\\n\\t]+"; " ") | .[0:140])\t\($body | gsub("[\\r\\n\\t]+"; " "))"
 '
 
+# --- the wait: poll on a timer, wake early on the receiver's event log ----------
+# Variables are prefixed per function (wf_, ev_): bash functions share globals,
+# and the cycle below owns keys/key/now/last.
+if stat -c '%Y %s' / >/dev/null 2>&1; then
+  list_sig() { stat -c '%Y %s' "$LIST" 2>/dev/null; }   # GNU
+else
+  list_sig() { stat -f '%m %z' "$LIST" 2>/dev/null; }   # BSD / macOS
+fi
+event_on() {
+  [ "${WATCH_EVENTS:-1}" != 0 ] && [ -f "$EVENT_DB" ] && command -v sqlite3 >/dev/null 2>&1
+}
+# Every read is read-only with a 2 s busy timeout. A failure (locked, unreadable,
+# not a database) prints nothing, which every caller treats as "no match".
+event_sql() {
+  sqlite3 -readonly -cmd '.timeout 2000' "$EVENT_DB" "$1" 2>/dev/null </dev/null
+}
+# Remember the newest rowid. A failed read leaves the saved value as it was.
+save_rowid() {
+  ev_max=$(event_sql 'SELECT coalesce(max(rowid), 0) FROM events')
+  case "$ev_max" in ''|*[!0-9]*) ;; *) printf '%s\n' "$ev_max" > "$ROWIDF" ;; esac
+}
+# SQL that finds a row past the saved rowid that concerns a watched PR, or ""
+# when there is nothing to match. Watched = this cycle's keys minus merged ones;
+# keys and tips only reach SQL as quoted literals (single quotes doubled).
+event_query() {
+  ev_saved=$(cat "$ROWIDF" 2>/dev/null)
+  case "$ev_saved" in ''|*[!0-9]*) return ;; esac
+  ev_watched=$(printf '%s\n' "$keys" | grep -vxF -f "$DONE")
+  [ -z "$ev_watched" ] && return
+  ev_prs=$(printf '%s\n' "$ev_watched" | awk -v q="'" \
+    'NF { k = tolower($0); gsub(q, q q, k); printf "%s(%s%s%s)", sep, q, k, q; sep = "," }')
+  # (repo, tip) pairs; the tip is a 12-char prefix of the status's 40-char hash.
+  ev_tips=$(awk -F'\t' -v q="'" -v k="$(printf '%s' "$ev_watched" | tr '\n' ' ')" '
+    BEGIN { n = split(k, a, " "); for (i = 1; i <= n; i++) w[a[i]] = 1 }
+    w[$1] { r = tolower($1); sub(/#.*/, "", r); t = $2; gsub(q, q q, r); gsub(q, q q, t)
+            printf "%s(%s%s%s,%s%s%s)", sep, q, r, q, q, t, q; sep = "," }
+  ' "$TIPS")
+  printf '%s' "WITH p(k) AS (VALUES $ev_prs), s(r, t) AS (VALUES ${ev_tips:-(NULL,NULL)})
+    SELECT 1 FROM events WHERE rowid > $ev_saved AND (
+      (event_key GLOB 'pullrequest:*'
+        AND lower(repo) || '#' || json_extract(payload, '\$.pullrequest.id') IN (SELECT k FROM p))
+      OR (event_key GLOB 'repo:commit_status_*'
+        AND EXISTS (SELECT 1 FROM s WHERE s.r = lower(repo)
+          AND substr(json_extract(payload, '\$.commit_status.commit.hash'), 1, length(s.t)) = s.t))
+    ) LIMIT 1"
+}
+# Block until it is time for the next cycle; logs why when WATCH_DEBUG=1.
+wait_for_wake() {
+  wf_t0=$SECONDS
+  wf_reason=interval
+  case "$INTERVAL" in
+    ''|*[!0-9]*) sleep "$INTERVAL" ;;   # not whole seconds: a plain sleep, as before
+    *)
+      wf_query=""
+      event_on && wf_query=$(event_query)
+      while :; do
+        wf_el=$((SECONDS - CYCLE_START))
+        [ "$wf_el" -ge "$INTERVAL" ] && break
+        if [ "$wf_el" -ge 5 ]; then
+          if [ "$(list_sig)" != "$LIST_SIG" ]; then wf_reason=watchlist; break; fi
+          if [ -n "$wf_query" ] && [ -n "$(event_sql "$wf_query")" ]; then
+            wf_reason=event
+            # Let a burst of events land in one cycle, but never run past the interval.
+            wf_rem=$((INTERVAL - wf_el))
+            sleep $((wf_rem < 3 ? wf_rem : 3))
+            break
+          fi
+        fi
+        wf_rem=$((INTERVAL - wf_el))
+        sleep $((wf_rem < 2 ? wf_rem : 2))
+      done
+      # Every wake saves the newest rowid before the cycle's twg calls: a row
+      # logged during the cycle then wakes the next wait, and rows from before
+      # this moment can never wake a PR that is added later.
+      event_on && save_rowid
+      ;;
+  esac
+  [ "${WATCH_DEBUG:-0}" = 1 ] && echo "bb-pr-watch: wait reason=$wf_reason secs=$((SECONDS - wf_t0))" >&2
+  return 0
+}
+# First run only: start from "now", so history never wakes a fresh watch. A
+# re-arm keeps the saved value, and a row logged in the gap wakes its first wait.
+if [ ! -s "$ROWIDF" ] && event_on; then save_rowid; fi
+
 cycle=0
 while true; do
-  [ "$cycle" -gt 0 ] && sleep "$INTERVAL"
+  [ "$cycle" -gt 0 ] && wait_for_wake
+  CYCLE_START=$SECONDS
   cycle=$((cycle + 1))
   now=$(date -u +%Y-%m-%dT%H:%M:%S)
 
@@ -243,6 +352,8 @@ while true; do
   posted=" $(tr -d ' \t' < "$POSTED" | tr '\n' ' ')"
 
   # Normalize the watchlist (URLs -> workspace/repo#num), dedupe, drop finished.
+  # The signature is taken first, so an append during this cycle wakes the next wait.
+  LIST_SIG=$(list_sig)
   keys=""
   if [ -f "$LIST" ]; then
     keys=$(sed -E 's|^(https?://)?(www\.)?bitbucket\.org/([^/]+)/([^/]+)/pull-requests/([0-9]+).*|\3/\4#\5|' "$LIST" \
@@ -258,6 +369,7 @@ while true; do
   : > "$COLLECTED"
   : > "$CAND"
   : > "$STATE_DIR/fail.new"
+  : > "$STATE_DIR/tips.new"
   for key in $keys; do
     wsrepo=${key%#*}
     num=${key##*#}
@@ -269,6 +381,8 @@ while true; do
 
     if [ -n "$row" ]; then
       printf '%s\n' "$row" >> "$CUR"
+      printf '%s' "$payload" | jq -r --arg key "$key" \
+        '(.source.commit.hash // "") | select(. != "") | "\($key)\t\(.)"' >> "$STATE_DIR/tips.new" 2>/dev/null
       printf '%s' "$payload" | jq -r --arg key "$key" --arg last "$last" \
         --arg sig "$SIGNATURE" --arg posted "$posted" "$COMMENT_FILTER" \
         >> "$CAND" 2>/dev/null
@@ -277,6 +391,7 @@ while true; do
       # Carry the last known row forward so a blip can't fabricate a "new PR"
       # or a CI flip, and record the failure for a once-per-streak notice.
       awk -F'\t' -v k="$key" '$1 == k {print; exit}' "$PREV" >> "$CUR"
+      awk -F'\t' -v k="$key" '$1 == k {print; exit}' "$TIPS" >> "$STATE_DIR/tips.new"
       msg=$(printf '%s' "$payload" | jq -r \
         '.error.message // .error.code // "no usable response"' 2>/dev/null | head -1)
       printf '%s\t%s\n' "$key" "$(printf '%s' "$msg" | tr -d '\r\n\t' | cut -c1-120)" >> "$STATE_DIR/fail.new"
@@ -358,6 +473,7 @@ while true; do
 
   cp "$CUR" "$PREV"
   cp "$STATE_DIR/fail.new" "$FAIL"
+  mv "$STATE_DIR/tips.new" "$TIPS"
   printf '%s\n' "$now" > "$LASTF"
   [ "$MAX_CYCLES" != 0 ] && [ "$cycle" -ge "$MAX_CYCLES" ] && exit 0
 done
