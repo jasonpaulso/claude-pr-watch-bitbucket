@@ -64,15 +64,15 @@
 # exactly as before (and a watchlist change waits for the next poll). With it,
 # the wait ticks every 2 s and ends at the first of:
 #   interval   WATCH_INTERVAL (default 60 s) after the previous cycle ENDED, to
-#              within a second early (bash's clock is whole seconds), never late
+#              within a second either way (bash's clock is whole seconds)
 #   watchlist  the watchlist file's size or mtime changed (a PR was added/removed)
 #   event      webhook-receiver logged a row for a watched PR past event.rowid:
 #              a pullrequest:* event naming it, or a commit status on its tip
 # watchlist and event wakes come no sooner than 5 s after the previous cycle
 # ended, and an event waits 3 s more so a burst becomes one cycle. A read of the
 # log can block 2 s on a locked DB, so none starts with under ~3 s of the
-# interval left and the wait never overruns the interval by more than the 0.3 s
-# the closing read may take. Any failed read counts as "no event", so the worst
+# interval left; on a locked DB the closing read still adds up to ~0.6 s (measured).
+# Any failed read counts as "no event", so the worst
 # case is the plain poll.
 #
 # Env overrides (for testing): WATCH_INTERVAL, WATCH_MAX_CYCLES (0 = forever),
@@ -90,6 +90,9 @@ export LC_ALL=C
 
 LIST="${WATCH_LIST:?set WATCH_LIST to the watchlist file path}"
 INTERVAL="${WATCH_INTERVAL:-60}"
+# Bash arithmetic reads a leading zero as octal (08 is an error, 010 is 8), and the
+# early wake does arithmetic on the interval; read whole numbers as decimal once, here.
+case "$INTERVAL" in ''|*[!0-9]*) ;; *) INTERVAL=$((10#$INTERVAL)) ;; esac
 MAX_CYCLES="${WATCH_MAX_CYCLES:-0}"
 TWG="${WATCH_TWG:-twg}"
 TWG_ARGS="--output json --output-summary none"

@@ -410,6 +410,16 @@ job_case10_approvals() {
   chk "an unapproved participant is not listed" t_lacks "$D/out" 'Bitbucket Pipelines'
   chk "0.2.4 missed the same approvals (the bug this fixes)" t_lacks "$D/old/out" 'APPROVALS'
 }
+# A leading zero must not make bash read the interval as octal: 08 crashed the early
+# wake's arithmetic (exit 1 at the first wait) while 0.2.4's plain `sleep 08` worked.
+job_case11_leading_zero() {
+  setup; seed_db "$DB"; echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
+  export WATCH_EVENT_DB=$DB WATCH_INTERVAL=08 WATCH_MAX_CYCLES=2 WATCH_DEBUG=1
+  launch "$NEW" "$D/out" "$D/err" "$D/rc"
+  wait_rc "$D/rc" 30 || { bail "watcher did not finish"; return; }
+  chk "WATCH_INTERVAL=08 runs to WATCH_MAX_CYCLES and exits 0" t_eq "$(cat "$D/rc"):$(ncalls)" "0:2"
+  chk "the wait was the 8 s interval" t_between "$(gap 1 2)" 7 9
+}
 job_case6_maxcycles() {
   setup; echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
   export WATCH_INTERVAL=1 WATCH_MAX_CYCLES=3 WATCH_DEBUG=1
@@ -477,7 +487,7 @@ mkdir "$T/old" "$T/res"
 git -C "$ROOT" show "$BASE_SHA:plugins/bb-pr-watch/scripts/watch-bb-pr-activity.sh" > "$T/old/watch-bb-pr-activity.sh" \
   || { echo "cannot read the 0.2.4 script at $BASE_SHA"; exit 1; }
 
-JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off case10_approvals"
+JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off case10_approvals case11_leading_zero"
 for j in $JOBS; do
   ( JOB=$j; "job_$j"; echo "DONE: $j" ) > "$T/res/$j.txt" 2>&1 &
 done
