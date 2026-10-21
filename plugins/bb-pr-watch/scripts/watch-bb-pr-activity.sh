@@ -320,7 +320,8 @@ wait_for_wake() {
     while :; do
       wf_el=$((SECONDS - wf_t0))
       [ "$wf_el" -ge "$INTERVAL" ] && break
-      if [ "$wf_el" -ge 5 ]; then
+      # SECONDS counts whole seconds, so 6 is the first count that guarantees 5 real ones.
+      if [ "$wf_el" -ge 6 ]; then
         if [ "$(list_sig)" != "$LIST_SIG" ]; then wf_reason=watchlist; break; fi
         # A read may block 2 s: only start one with a clear margin left.
         if [ -n "$wf_query" ] && [ $((INTERVAL - wf_el)) -ge 4 ] && [ -n "$(event_sql "$wf_query")" ]; then
