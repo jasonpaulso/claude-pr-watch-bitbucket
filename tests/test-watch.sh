@@ -234,7 +234,14 @@ case1() {  # variant
   case $1 in locked*) exec 9>&- ;; esac
   chk "[$1] exits 0 at WATCH_MAX_CYCLES" t_eq "$(cat "$D/rc")" 0
   chk "[$1] polled every PR every cycle" t_eq "$(ncalls)" $((n * npr))
-  chk "[$1] output equals 0.2.4's" t_same "$D/old/out" "$D/out"
+  # Since 2026-10-22 CI moves to pending/no-build and automation comments are not emitted;
+  # compare everything else byte for byte, then check those two directly.
+  norm() { grep -vE '^CI: .* — now (pending|no-build) \(|^COMMENTS ' "$1"; }
+  norm "$D/old/out" > "$D/old/out.norm"; norm "$D/out" > "$D/out.norm"
+  chk "[$1] output equals 0.2.4's (minus pending CI and comment lines)" t_same "$D/old/out.norm" "$D/out.norm"
+  chk "[$1] no CI line for a move to pending" t_lacks "$D/out" '— now pending ('
+  chk "[$1] automation comments not emitted" t_lacks "$D/out" 'automation)'
+  chk "[$1] review-bot comments still emitted" t_has "$D/out" 'review-bot)' 
   chk "[$1] every wait ended by interval" t_eq "$(reasons "$D/err")" "$(i=1; while [ $i -lt $n ]; do printf 'interval '; i=$((i + 1)); done)"
   # The 2 s busy timeout of a locked DB must not stretch the wait (verifier: 6 -> 8 s, 60 -> 62 s).
   chk "[$1] longest wait <= WATCH_INTERVAL + 1 s (measured $(max_secs "$D/err") s of $iv)" t_between "$(max_secs "$D/err")" 0 $((iv + 1))

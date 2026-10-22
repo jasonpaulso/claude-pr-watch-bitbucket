@@ -470,12 +470,15 @@ while true; do
   join -t "$TAB" -j 1 -v 2 "$PREV" "$CUR" 2>/dev/null \
     | awk -F'\t' '{printf "WATCHING: %s — %s (%s, CI: %s)\n", $1, $5, tolower($2), $3}'
 
-  # State transitions, CI changes, new approvals. A carried-forward row is
+  # State transitions, CI changes, new approvals. CI fires only on arriving at
+  # failing or passing: a move to pending/no-build needs no action and only woke
+  # the session for nothing (Jason, 2026-10-22). Automation comments (Nx Cloud
+  # "View your CI Pipeline Execution" links) are dropped below for the same reason. A carried-forward row is
   # byte-identical to last cycle's, so a failed lookup fires nothing.
   join -t "$TAB" -j 1 "$PREV" "$CUR" 2>/dev/null > "$STATE_DIR/joined.tsv"
   awk -F'\t' '$2 == "OPEN" && $6 == "MERGED"   {printf "MERGED: %s — %s\n", $1, $9}
               $2 == "OPEN" && $6 == "DECLINED"  {printf "DECLINED: %s — %s\n", $1, $9}
-              $2 == "OPEN" && $6 == "OPEN" && $3 != $7 {printf "CI: %s — now %s (was %s) — %s\n", $1, $7, $3, $9}
+              $2 == "OPEN" && $6 == "OPEN" && $3 != $7 && ($7 == "failing" || $7 == "passing") {printf "CI: %s — now %s (was %s) — %s\n", $1, $7, $3, $9}
               $2 == "OPEN" && $6 == "OPEN" && $4 != $8 && $8 != "" {printf "APPROVALS: %s — approved by %s — %s\n", $1, $8, $9}' \
     "$STATE_DIR/joined.tsv"
 
@@ -488,6 +491,7 @@ while true; do
   # New/edited comments — grouped per PR into ONE event line so a burst of
   # review comments can't split across notifications.
   awk -F'\t' '
+    index($2, ", automation)") { next }
     { c[$1]++; if (t[$1] != "") t[$1] = t[$1] " ¦ "; t[$1] = t[$1] $2 ": " $3 }
     END { for (k in c) printf "COMMENTS %s — %d new: %s\n", k, c[k], substr(t[k], 1, 500) }
   ' "$COLLECTED"
