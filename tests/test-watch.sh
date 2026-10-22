@@ -420,6 +420,24 @@ job_case11_leading_zero() {
   chk "WATCH_INTERVAL=08 runs to WATCH_MAX_CYCLES and exits 0" t_eq "$(cat "$D/rc"):$(ncalls)" "0:2"
   chk "the wait was the 8 s interval" t_between "$(gap 1 2)" 7 9
 }
+# Bitbucket spells a running build INPROGRESS (no underscore): 0.2.4 matched only
+# IN_PROGRESS, so a build still running rolled up as "passing" (fe-main #1531, 2026-10-22).
+job_case12_inprogress() {
+  setup; echo busie/fe-main#1512 > "$LIST"
+  pr_json OPEN "$TIP" "[{\"commit\":{\"hash\":\"$FULL\"},\"state\":\"INPROGRESS\"}]" '[]' '[]' 'Trip planner' > "$FIX/1512.json"
+  mkdir -p "$D/old/fix"; cp "$FIX"/*.json "$D/old/fix/"; cp "$LIST" "$D/old/w.watchlist"
+  export WATCH_EVENTS=0 WATCH_INTERVAL=1 WATCH_MAX_CYCLES=1
+  (
+    export WATCH_LIST=$D/old/w.watchlist FIXDIR=$D/old/fix
+    FIX=$D/old/fix launch "$T/old/watch-bb-pr-activity.sh" "$D/old/out" "$D/old/err" "$D/old/rc"
+  )
+  launch "$NEW" "$D/out" "$D/err" "$D/rc"
+  wait_rc "$D/rc" 20 || { bail "watcher did not finish"; return; }
+  wait_rc "$D/old/rc" 20 || bail "0.2.4 run did not finish"
+  chk "an INPROGRESS build on the tip reads pending" t_has "$D/out" 'CI: pending'
+  chk "...not passing" t_lacks "$D/out" 'CI: passing'
+  chk "0.2.4 called the same build passing (the bug this fixes)" t_has "$D/old/out" 'CI: passing'
+}
 job_case6_maxcycles() {
   setup; echo busie/fe-main#1512 > "$LIST"; simple_pr "$FIX" 1512
   export WATCH_INTERVAL=1 WATCH_MAX_CYCLES=3 WATCH_DEBUG=1
@@ -487,7 +505,7 @@ mkdir "$T/old" "$T/res"
 git -C "$ROOT" show "$BASE_SHA:plugins/bb-pr-watch/scripts/watch-bb-pr-activity.sh" > "$T/old/watch-bb-pr-activity.sh" \
   || { echo "cannot read the 0.2.4 script at $BASE_SHA"; exit 1; }
 
-JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off case10_approvals case11_leading_zero"
+JOBS="syntax case1_nodb case1_off case1_locked case1_locked60 case1_unreadable case1_nosqlite case2_comment case3_status case4_watchlist case5_rowid case5_rearm case6_duplicate case6_resume case6_maxcycles case7_off case7_nodb case8_rowid_memory case9_longcycle_on case9_longcycle_off case10_approvals case11_leading_zero case12_inprogress"
 for j in $JOBS; do
   ( JOB=$j; "job_$j"; echo "DONE: $j" ) > "$T/res/$j.txt" 2>&1 &
 done

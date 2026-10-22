@@ -203,7 +203,7 @@ PR_FILTER='
      | (.state // "PENDING" | ascii_upcase)]) as $s
   | (if ($s | length) == 0 then "no-build"
      elif ($s | any(. == "FAILED" or . == "ERROR" or . == "STOPPED")) then "failing"
-     elif ($s | any(. == "IN_PROGRESS" or . == "BUILDING" or . == "PENDING"
+     elif ($s | any(. == "INPROGRESS" or . == "IN_PROGRESS" or . == "BUILDING" or . == "PENDING"
                    or . == "HALTED" or . == "QUEUED" or . == "IN_QUEUE")) then "pending"
      else "passing" end) as $ci
   # Approvals live on participants, whatever their role: the Bitbucket reviewers list carries
